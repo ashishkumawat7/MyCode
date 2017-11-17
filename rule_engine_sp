@@ -1,0 +1,141 @@
+DELIMITER $$
+CREATE DEFINER=`tempuser`@`xhadfmkm2p.aetna.com` PROCEDURE `pi_acas_prpay_excl_rule_engine_fwa_v01`(in iv_src_table varchar(40),in iv_tgt_table varchar(40),in_load_year varchar(40),in_load_month varchar(40),in_load_day varchar(40),in_batch_id varchar(40),OUT ov_hive_excl_query LONGTEXT)
+Block1: BEGIN
+DECLARE done_t int default 0; 
+/*Block 1 will fetch the different rule types */
+DECLARE v_query_res LONGTEXT DEFAULT '';
+DECLARE v_ind_query_res LONGTEXT DEFAULT ' CASE ';
+DECLARE v_target_table_cols TEXT DEFAULT '';
+DECLARE v_source_table_cols TEXT DEFAULT '';
+DECLARE v_source_table_partition_cols TEXT DEFAULT '';
+DECLARE v_target_table_partition_cols TEXT DEFAULT '';
+DECLARE v_rule_type_t TEXT DEFAULT '';
+
+
+
+declare rule_type_cur CURSOR FOR
+select distinct a.rule_type,a.target_table_cols,a.source_table_cols,a.source_table_partition_cols,a.target_table_partition_cols FROM pi_acas_prpay_excl_rules_setup_fwa a
+where CURDATE() BETWEEN CAST(a.rule_eff_dt AS DATE) AND CAST(a.rule_exp_dt AS DATE) and source_table=iv_src_table and target_table=iv_tgt_table order by a.rule_type;
+DECLARE CONTINUE HANDLER FOR NOT FOUND SET done_t = 1;
+DELETE FROM pi_acas_prpay_excl_rules_def_fwa_bkp;
+				 INSERT INTO pi_acas_prpay_excl_rules_def_fwa_bkp SELECT * FROM pi_acas_prpay_excl_rules_def_fwa;
+                
+				UPDATE pi_acas_prpay_excl_rules_def_fwa a
+				SET a.Rule_attrib_value = (SELECT concat("'", group_concat(b.unit_id SEPARATOR '|') , "'") 
+                           FROM
+					           fraud_prepay_lead b 
+                               WHERE a.rule_attrib_name ='prov_pin' AND 
+                                     b.unit_type = 'PROVIDER' AND 
+									 (2000 +b.Rule_id) = a.Rule_id 
+							   GROUP BY (2000 + b.Rule_id)
+						  )
+				WHERE a.rule_attrib_name ='prov_pin'  AND a.Rule_id IN (SELECT DISTINCT (2000 + Rule_id) FROM fraud_prepay_lead);
+ 
+
+open rule_type_cur;
+rule_t : loop 
+fetch rule_type_cur into v_rule_type_t,v_target_table_cols,v_source_table_cols,v_source_table_partition_cols,v_target_table_partition_cols;
+IF done_t = 1 THEN
+            LEAVE rule_t;
+            END IF;
+Blockt : Begin
+/*Block t will fetch the different ruleid's with different rule types */
+DECLARE done_1 int default 0; 
+declare v_final_Rule_id int;
+DECLARE v_rule_type TEXT DEFAULT '';
+DEClARE rules_final_cur CURSOR FOR 
+ SELECT distinct a.Rule_id,a.rule_type FROM pi_acas_prpay_excl_rules_setup_fwa a 
+ where a.source_table=iv_src_table and target_table=iv_tgt_table and a.rule_type=v_rule_type_t
+ and (CURDATE() BETWEEN CAST(a.rule_eff_dt AS DATE) AND CAST(a.rule_exp_dt AS DATE))
+ order by a.Rule_id;
+DECLARE CONTINUE HANDLER FOR NOT FOUND SET done_1 = 1;
+open rules_final_cur;
+rule_1 : loop 
+fetch rules_final_cur into v_final_Rule_id,v_rule_type;
+set v_query_res ='';
+set v_ind_query_res=concat(v_ind_query_res,' WHEN ');
+IF done_1 = 1 THEN
+            LEAVE rule_1;
+            END IF;
+Block2: Begin
+/*Block 2 will fetch rule levels along with rule level operators*/
+DECLARE done_2 int default 0;
+DECLARE v_query_res_1 LONGTEXT DEFAULT '';
+declare v_Rule_id int;
+declare v_Rule_level int;
+declare v_Rule_level_type VARCHAR(20);
+declare v_rule_level_seq int DEFAULT 1;
+declare v_max_rule_level_seq int;
+declare v_Rule_level_operator VARCHAR(20);
+DEClARE rules_cur CURSOR FOR 
+ SELECT distinct a.Rule_id, a.Rule_level,a.rule_type,a.Rule_level_operator FROM pi_acas_prpay_excl_rules_fwa a 
+ where a.Rule_id=v_final_Rule_id and a.rule_type= v_rule_type and (CURDATE() BETWEEN CAST(a.rule_eff_dt AS DATE) AND CAST(a.rule_exp_dt AS DATE)) order by a.Rule_id, a.Rule_level, a.Rule_Dependency;
+DECLARE CONTINUE HANDLER FOR NOT FOUND SET done_2 = 1;  
+  open rules_cur;
+     rule_2 : loop
+        fetch rules_cur into v_Rule_id,v_Rule_level,v_Rule_level_type,v_Rule_level_operator;
+IF done_2 = 1 THEN
+            LEAVE rule_2;
+            END IF;
+SELECT 
+    MAX(rule_level_seq)
+INTO v_max_rule_level_seq FROM
+    pi_acas_prpay_excl_rules_def_fwa b
+WHERE
+    b.Rule_id = v_Rule_id
+        AND b.Rule_level = v_Rule_level
+        AND (CURDATE() BETWEEN CAST(b.rule_eff_dt AS DATE) AND CAST(b.rule_exp_dt AS DATE));
+        set v_rule_level_seq =1;
+        set v_query_res_1 = ' ';
+/*Check for Multiple levels in a single level*/        
+while  v_rule_level_seq  <= v_max_rule_level_seq do
+SELECT
+    CONCAT(b.Rule_attrib_name,
+            ' ',
+            b.name_val_rel,
+            ' ',
+            b.Rule_attrib_value,
+            ' ',
+            ifnull(b.Rule_Operator,' )'))
+INTO v_query_res_1 FROM
+    pi_acas_prpay_excl_rules_fwa a
+        JOIN
+    pi_acas_prpay_excl_rules_def_fwa b ON a.Rule_id = b.Rule_id
+        AND a.Rule_level = b.Rule_level
+WHERE
+    b.Rule_id = v_Rule_id
+        AND b.Rule_level = v_Rule_level
+        AND b.rule_level_seq = v_rule_level_seq
+        AND (CURDATE() BETWEEN CAST(a.rule_eff_dt AS DATE) AND CAST(a.rule_exp_dt AS DATE))
+        AND (CURDATE() BETWEEN CAST(b.rule_eff_dt AS DATE) AND CAST(b.rule_exp_dt AS DATE));
+/*Consolidate all sublevels into a single rule*/
+if v_rule_level_seq = 1 then
+set v_query_res = concat(v_query_res,' ( ',v_query_res_1);
+set v_ind_query_res=concat(v_ind_query_res,' (' , v_query_res_1);
+else
+set v_query_res = concat(v_query_res,' ',v_query_res_1);
+set v_ind_query_res=concat(v_ind_query_res,'  ' , v_query_res_1);
+end if;
+set v_rule_level_seq=v_rule_level_seq+1;
+end while;
+/*Consolidate all rules into a single CASE statement for each rule type*/
+/*set v_ind_query_res=TRIM(LEADING ' WHEN (' FROM v_ind_query_res);*/
+set v_ind_query_res=concat( v_ind_query_res,' ', ifnull(v_Rule_level_operator,' '));
+set v_query_res=concat( v_query_res,' ', ifnull(v_Rule_level_operator,' '));
+end loop rule_2;
+set v_ind_query_res=concat(v_ind_query_res,' THEN ''',v_Rule_id,'''');
+close rules_cur;
+end Block2;
+end loop rule_1;
+close rules_final_cur;
+END Blockt;
+set v_ind_query_res=concat(TRIM(TRAILING ' WHEN ' FROM v_ind_query_res),' else ''NA'' end as ',v_target_table_cols,' , CASE ');
+end loop rule_t;
+/* Replace the Partition Columns parameters with the actual values*/
+set v_source_table_partition_cols= replace(replace(replace(replace(v_source_table_partition_cols,'hiveconf:',''),'DD',in_load_day),'MM',in_load_month),'YYYY',in_load_year);
+set v_target_table_partition_cols= replace(replace(replace(replace(v_target_table_partition_cols,'hiveconf:',''),'DD',in_load_day),'MM',in_load_month),'YYYY',in_load_year);/*Form the Hive Query with insert overwrite statement on target table with dynamic select statement 
+with Pre and Post exclusion Rules which needs to be applied on Source table*/
+set  ov_hive_excl_query = concat('INSERT INTO TABLE ',iv_tgt_table,'  PARTITION (',v_target_table_partition_cols,' ) SELECT ',trim(v_source_table_cols),TRIM(TRAILING ' , CASE ' FROM v_ind_query_res), ' FROM ',iv_src_table,' WHERE ', REPLACE(v_source_table_partition_cols,',',' AND '),' ;');
+close rule_type_cur;
+END Block1$$
+DELIMITER ;
