@@ -1,0 +1,11 @@
+mkdir <git repository name>      # you can choose any name that would help you identify what project this is about
+cd <git repository name>             # change your working directory to one where you would do your changes
+git init                                                   # Initialize git in your local directory
+git remote add <name for the connection> <link to the connection> # for eg: git remote add pi_reop git@xhadjkgitm1p.aetna.com:claims-analytics/pi_consultants.git
+git pull <connection name> <branch to pull from> # for eg: git pull pi_repo dev. This needs to be run prior to making any changes to the code to ensure you are in sync with remote repository. This brings in all the code and version history to local
+git checkout –b dev         # required only first time to create a new local branch and switches to it
+
+# Make your changes to the respective files after you execute the git pull command. This ensures retention of proper version history
+git add <file name/directory name>
+git commit –m “[process name] - <Change description>”     #This comment shows up in git front end once pushed to git in the next command
+git push <connection name> <branch> #for eg: git push pi_repo dev            
