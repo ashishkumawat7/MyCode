@@ -1,0 +1,358 @@
+import pandas as pd
+from pyspark.sql import HiveContext, SQLContext
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+import sys
+
+import re
+from dateutil.parser import parse
+from datetime import datetime, timedelta
+from pyspark.sql.functions import round
+
+table_name=sys.argv[1]
+print "feature table:{}".format(table_name)
+
+from pyspark import SparkContext,SparkConf
+conf = (SparkConf().setAppName("ceqaqc"))
+sc = SparkContext("local", "ceqaqc")
+sqlContext = HiveContext(sc)
+
+Input='NA'
+while Input not in ('Y','N'):      
+    Input=sys.argv[2]
+    if Input=='Y':    
+        columns=sys.argv[3]
+        tableDF=sqlContext.table(table_name).select(columns.strip().split(','))
+    elif Input=='N':
+        tableDF = sqlContext.table(table_name)
+    else:
+        print "***PLEASE GIVE A CORRECT INPUT 'Y' or 'N'***"  
+
+numericTypes = [BooleanType(), ByteType(), DecimalType(30,2), DecimalType(32,2),DecimalType(38,2), DoubleType(), FloatType(), IntegerType(), LongType(), ShortType()]
+nonNumericTypes = [BinaryType(), DateType(), StringType(), TimestampType()]
+numericColumns = [fld.name for fld in tableDF.schema.fields if fld.dataType in numericTypes]
+nonNumericColumns = [fld.name for fld in tableDF.schema.fields if fld.dataType in nonNumericTypes]
+
+print "Non-numeric Columns:", nonNumericColumns
+print "Numeric Columns:", numericColumns
+print "Fallout Columns:", set(tableDF.columns) - (set(numericColumns) | set(nonNumericColumns))
+print "Duplicate Columns:", set(numericColumns) & set(nonNumericColumns)
+
+categorical_no=len(nonNumericColumns)
+numerical_no=len(numericColumns)
+total_columns=categorical_no+numerical_no
+if (numerical_no==0):
+	cat_per_num=100
+else:
+	cat_per_num= (float(categorical_no)/float(numerical_no))*100
+catpernum=pd.DataFrame()
+catpernum=catpernum.append({"Number of Categorical Features":categorical_no,"Number of Numerical Features":numerical_no,"Categorical to numerical percent":cat_per_num},ignore_index=True)
+
+regex = '(.*)\.(.*)'
+matches = re.search(regex,table_name)
+table= matches.group(2) 
+import time
+## dd-mm-yyyy format
+curr_date=time.strftime("%d-%m-%Y")
+
+#writer is the excel sheet that will be generated
+writer = pd.ExcelWriter(table+'_'+curr_date+'.xlsx', engine='xlsxwriter')
+catpernum.to_excel(writer,sheet_name='Sheet1',index=False,columns=["Number of Categorical Features","Number of Numerical Features","Categorical to numerical percent"])
+curr_date
+
+categ_df=tableDF.select(nonNumericColumns) 
+def levels(categ_df):
+    names = categ_df.columns
+    values = []
+    for x in names:       
+        tmp = categ_df.select(x).distinct().count()
+        values.append(tmp)
+    level_dict = zip(names,values)
+    final = pd.DataFrame(level_dict, columns=['column_name', 'level_count']).set_index('column_name')
+    return final
+levcnt_pdf_cat=levels(categ_df)
+
+def val_count(val_name,col_type):
+    if val_name == 'notNull':
+        num=[sum(when(col(c).isNotNull(), 1).otherwise(0)).alias(c) for c in col_type]
+    else:
+        if val_name == 'Null':
+            num=[sum(when(col(c).isNull(), 1).otherwise(0)).alias(c) for c in col_type]
+        else:
+            num=[sum(when(col(c) ==val_name, 1).otherwise(0)).alias(c) for c in col_type]
+    pdf_num = tableDF.agg(*num).toPandas()
+    pdf_t_num = pdf_num.T
+    return pdf_t_num
+
+count_pdf_t_cat=val_count('notNull',nonNumericColumns)
+count_pdf_t_cat.columns = ['count_1']
+
+nulls_pdf_t_cat = val_count('Null',nonNumericColumns)
+nulls_pdf_t_cat.columns = ['nulls_count']
+
+na_pdf_t_cat = val_count('NA',nonNumericColumns)
+na_pdf_t_cat.columns = ['nas_count']
+
+blank_pdf_t_cat =val_count('',nonNumericColumns)
+blank_pdf_t_cat.columns = ['blanks_count']
+
+final_pdf_cat=count_pdf_t_cat.join(levcnt_pdf_cat).join(nulls_pdf_t_cat).join(na_pdf_t_cat).join(blank_pdf_t_cat)
+final_pdf_cat['categorical_feature']=final_pdf_cat.index
+
+final_pdf_cat['count_1']=final_pdf_cat['nulls_count']+final_pdf_cat['count_1']
+final_pdf_cat['missing_count']=final_pdf_cat['nulls_count']+final_pdf_cat['nas_count']+final_pdf_cat['blanks_count']
+final_pdf_cat['nulls_percent']=final_pdf_cat['nulls_count']*100/final_pdf_cat['count_1']
+final_pdf_cat['nas_percent']=final_pdf_cat['nas_count']*100/final_pdf_cat['count_1']
+final_pdf_cat['blanks_percent']=final_pdf_cat['blanks_count']*100/final_pdf_cat['count_1']
+final_pdf_cat['missing_percent']= final_pdf_cat['missing_count']*100/final_pdf_cat['count_1']
+
+missing_cat=final_pdf_cat[final_pdf_cat['missing_percent']<1]
+misslist_cat=missing_cat[['categorical_feature']]
+misslist_cat.rename(columns={"categorical_feature":"Categorical features with missing values less than 1 percent"},inplace=True)
+misslist_count=pd.DataFrame()
+
+greater_level=final_pdf_cat[final_pdf_cat['level_count']>30] 
+greater_levellsist=greater_level[['categorical_feature']]
+greater_levellsist.rename(columns={"categorical_feature":"Categorical features with levels greater than 30"},inplace=True)
+
+if len(misslist_cat)>len(greater_levellsist):
+    max1=len(misslist_cat)
+else:
+    max1=len(greater_levellsist)
+
+if len(numericColumns)==0:
+    
+    print "There are no numeric columns in input table {}".format(table_name)
+    misslist_count=misslist_count.append({"Percent of Features with missing values less than 1 percent":float(len(misslist_cat))*100/float(total_columns)},ignore_index=True)
+    misslist_count.to_excel(writer,startcol=len(catpernum.columns),sheet_name='Sheet1',index=False)
+    misslist_cat.to_excel(writer,startrow=len(catpernum)+2,sheet_name='Sheet1',index=False)
+    greater_levellsist.to_excel(writer,startrow=len(catpernum)+2,startcol=1,sheet_name='Sheet1',index=False)
+    final_pdf_cat.to_excel(writer,startrow=len(catpernum)+2+max1+2,sheet_name='Sheet1',index=False,columns=["categorical_feature",
+                    "count_1","level_count","nulls_count","nulls_percent","nas_count","nas_percent","blanks_count","blanks_percent"])
+else:
+    
+
+    summary_pdf = tableDF.select(numericColumns).describe().toPandas()
+    summary_pdf_t = summary_pdf.T
+    summary_pdf_t.columns = summary_pdf_t.iloc[0]
+    summary_pdf_t.drop(summary_pdf_t.index[[0]], inplace=True)
+    
+    count_pdf_t_num = val_count('notNull',numericColumns)
+    count_pdf_t_num.columns= ['count_2']
+    
+    zeros_pdf_t_num = val_count(0,numericColumns)
+    zeros_pdf_t_num.columns = ['zeros_count']
+    
+    nulls_pdf_t_num =val_count('Null',numericColumns)
+    nulls_pdf_t_num.columns = ['nulls_count']
+
+    na_pdf_t_num = val_count('NA',numericColumns)
+    na_pdf_t_num.columns = ['nas_count']
+    
+    blank_pdf_t_num = val_count('',numericColumns)
+    blank_pdf_t_num.columns = ['blanks_count']
+    
+    final_pdf_num=summary_pdf_t.join(count_pdf_t_num).join(nulls_pdf_t_num).join(na_pdf_t_num).join(blank_pdf_t_num)
+    final_pdf_num['numerical_feature']=final_pdf_num.index
+    
+    final_pdf_num['count_2']=final_pdf_num['count_2'].astype(int)
+    final_pdf_num['count_2']=final_pdf_num['nulls_count']+final_pdf_num['count_2'] #why not sum of all the counts
+    final_pdf_num['missing_count']=final_pdf_num['nulls_count']+final_pdf_num['nas_count']+final_pdf_num['blanks_count']
+    final_pdf_num['nulls_percent']=final_pdf_num['nulls_count']*100/final_pdf_num['count_2']
+    final_pdf_num['nas_percent']=final_pdf_num['nas_count']*100/final_pdf_num['count_2']
+    final_pdf_num['blanks_percent']=final_pdf_num['blanks_count']*100/final_pdf_num['count_2']
+    final_pdf_num['missing_percent']= final_pdf_num['missing_count']*100/final_pdf_num['count_2']
+    missing_num=final_pdf_num[final_pdf_num['missing_percent']<1]
+    misslist_num=missing_num[['numerical_feature']]
+    misslist_num.rename(columns={"numerical_feature":"Numerical features with missing values less than 1 percent"},inplace=True)
+    misslist_count=misslist_count.append({"Percent of Features with missing values less than 1 percent":float(len(misslist_cat)+len(misslist_num))*100/float(total_columns)},ignore_index=True)
+    
+    if max1>len(misslist_num):
+        max2=max1
+    else:
+        max2=len(misslist_num)
+    misslist_count.to_excel(writer,startcol=len(catpernum.columns),sheet_name='Sheet1',index=False)
+    misslist_cat.to_excel(writer,startrow=len(catpernum)+2,sheet_name='Sheet1',index=False)
+    greater_levellsist.to_excel(writer,startrow=len(catpernum)+2,startcol=1,sheet_name='Sheet1',index=False)
+    misslist_num.to_excel(writer,startrow=len(catpernum)+2,startcol=2,sheet_name='Sheet1',index=False)
+    final_pdf_cat.to_excel(writer,startrow=len(catpernum)+2+max2+2,sheet_name='Sheet1',index=False,columns=["categorical_feature",
+                "count_1","level_count","nulls_count","nulls_percent","nas_count","nas_percent","blanks_count","blanks_percent"])
+    final_pdf_num.to_excel(writer,startrow=len(catpernum)+2+max2+2+len(final_pdf_cat)+2,sheet_name='Sheet1',index=False,columns=["numerical_feature","count","mean","stddev","min","max","nulls_count","nulls_percent","nas_count","nas_percent","blanks_count","blanks_percent"])
+
+
+
+query = "describe formatted {}".format(table_name)
+sample = sqlContext.sql(query).collect()
+c1=tableDF.columns
+for i in range(len(sample)):
+    regex = '\t(transient_lastDdlTime)\t(\d+)'
+    if(re.search(regex,sample[i]['result'])):
+        match=re.search(regex,sample[i]['result']).group(2)
+    else:
+        continue
+    
+query1="SELECT from_unixtime({}, 'dd-MMM-yyyy') as modified_date".format(int(match))
+output=sqlContext.sql(query1).collect()
+q=output[0]['modified_date']
+print("Modified Date: "+ parse(q).strftime('%d-%m-%Y'))
+modified_dt=pd.DataFrame()
+modified_dt=modified_dt.append({"Modified Date":parse(q).strftime('%d-%m-%Y')},ignore_index=True)
+modified_dt.to_excel(writer,sheet_name='Sheet2',index=False)
+
+#curren_count -> number of records in the table
+curr_count=tableDF.count()
+print "curr_count :{}".format(curr_count)
+
+
+#get the ideal date for last run
+if Input=='Y':
+	if(sys.argv[4] =='NA'):
+		searchfile = open("table_track", "r")
+		for line in searchfile:
+			if table_name in line:
+				prev_run_date= line.split(',')[0].strip()
+		searchfile.close()
+	else:
+		days=int(sys.argv[4])
+		prev_run_date=(datetime.now() - timedelta(days)).strftime('%d-%m-%Y')
+else:
+	if(sys.argv[3] =='NA'):
+		searchfile = open("table_track", "r")
+		for line in searchfile:
+			if table_name in line:
+				prev_run_date= line.split(',')[0].strip()
+		searchfile.close()
+	else:
+		days=int(sys.argv[3])
+		prev_run_date=(datetime.now() - timedelta(days)).strftime('%d-%m-%Y')
+
+print "prev_run_date :{}".format(prev_run_date)
+
+
+# Get the count associated with the previous run
+searchfile = open("table_track", "r")
+prev_count='NULL'
+for line in searchfile:
+    if table_name in line:
+        if prev_run_date in line:
+            prev_count= line.split(',')[3].strip()
+searchfile.close()
+print "prev_count :{}".format(prev_count)
+
+
+# for Skip Indicator
+searchfile = open("table_track", "r")
+last_date='NULL'
+skip_ind='NULL'
+for line in searchfile:
+    if table_name in line: 
+        last_date=line.split(',')[0]
+        print last_date
+        if last_date <> prev_run_date:
+            skip_ind=1
+            print "previous run didn't happen"
+            break
+        else:
+            skip_ind=0
+            break
+    else:
+        skip_ind=2
+        
+searchfile.close()
+print "skip_ind :{}".format(skip_ind)
+
+
+#for writing into textfile
+
+searchfile = open("table_track", "a+")
+searchfile.write("\n"+str(curr_date)+","+str(table_name)+","+str(prev_count)+","+str(curr_count))
+searchfile.close()
+
+
+
+#for deleting the previous entry forthe same table
+searchfile = open("table_track", "rw")
+
+for line in searchfile:
+    if str(table_name) in line:
+        date=line.split(',')[0]
+        if date<>curr_date:
+            remove_line=line
+            break
+    else:
+        remove_line=''  
+    
+searchfile.close()
+
+searchfile = open("table_track", "r")          
+lines = searchfile.readlines()
+searchfile.close()
+
+searchfile = open("table_track", "w")  
+for line in lines:
+    if line <> remove_line:
+        searchfile.write(line)
+    else:
+        continue
+searchfile.close()           
+print remove_line
+
+
+
+if skip_ind==0 :
+    per_change = (float(curr_count)-float(prev_count))*100/float(prev_count)   
+    op=sqlContext.createDataFrame([(per_change,)], ['a']).select(round('a', 4).alias('r')).collect()
+    per_change=op[0]['r']
+    if -5 <= per_change <= 5:
+        Message="Table's count lies in the bounds"
+    else:
+        Message="Table's count doesn't lie in the bounds"
+else:
+    if skip_ind==1:
+        per_change='NULL'
+        Message='Last run does not correspond to the last run of the table' 
+    else: #skip_ind==2
+        per_change='NULL'
+        Message='This is the first run of the script for the table '+str(table_name)
+
+
+
+output={}
+output["Previous Count"]=[prev_count]
+output["Current Count"]=[curr_count]
+output["Percentage Change in the Volume"]=[per_change]
+output["Message"]=[Message]
+Result = pd.DataFrame(output, columns=["Previous Count","Current Count","Percentage Change in the Volume","Message"])
+Result.to_excel(writer,startcol=1,sheet_name='Sheet2',index=False)
+Result
+
+
+
+sheet_name = 'Sheet2'
+workbook = writer.book
+worksheet = writer.sheets[sheet_name]
+# Light red fill with black text.
+format1 = workbook.add_format({'bg_color':   '#FC3927',
+                               'font_color': '#000000'})
+# Light yellow fill with black text.
+format2 = workbook.add_format({'bg_color':   '#FFFF00',
+                               'font_color': '#000000'})
+# Green fill with black text.
+format3 = workbook.add_format({'bg_color':   '#99FF71',
+                               'font_color': '#000000'})
+
+worksheet.conditional_format('E2', {'type':     'formula',
+                                    'criteria': '=AND($D$2>-5,$D$2<5)',
+                                    'format':   format3})
+worksheet.conditional_format('E2', {'type':     'formula',
+                                    'criteria': '=$D$2="NULL"',
+                                    'format':   format2})
+
+worksheet.conditional_format('E2', {'type':     'formula',
+                                    'criteria': '=OR($D$2<-5,$D$2>5,$D$2=5,$D$2=-5)',
+                                    'format':   format1})
+
+writer.save()
+sc.stop()
+sys.exit()
+
